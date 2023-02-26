@@ -1,13 +1,13 @@
-from shutil import which
 import sys
 import os
+import argparse
 import tempfile
 from PyQt5 import QtCore, QtGui
-from PyQt5.QtCore import Qt, pyqtSlot, pyqtSignal, QThread
+from PyQt5.QtCore import QObject, Qt, pyqtSlot, pyqtSignal, QThread
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import QMainWindow, QApplication, QMessageBox, QVBoxLayout, QWidget, QShortcut,\
-    QPushButton, QTextEdit, QFormLayout, QHBoxLayout, QDoubleSpinBox
+    QPushButton, QTextEdit, QLineEdit, QFormLayout, QHBoxLayout, QCheckBox, QSpinBox, QDoubleSpinBox
 from pix2tex.resources import resources
 from pynput.mouse import Controller
 
@@ -27,10 +27,16 @@ class App(QMainWindow):
     def __init__(self, args=None):
         super().__init__()
         self.args = args
-        self.model = cli.LatexOCR(self.args)
+        self.initModel()
         self.initUI()
         self.snipWidget = SnipWidget(self)
+
         self.show()
+
+    def initModel(self):
+        args, *objs = cli.initialize(self.args)
+        self.args = args
+        self.objs = objs
 
     def initUI(self):
         self.setWindowTitle("LaTeX OCR")
@@ -53,17 +59,13 @@ class App(QMainWindow):
 
         # Create temperature text input
         self.tempField = QDoubleSpinBox(self)
-        self.tempField.setValue(self.args.temperature)
+        self.tempField.setValue(self.args.get('temperature', 0.25))
         self.tempField.setRange(0, 1)
         self.tempField.setSingleStep(0.1)
 
         # Create snip button
-        if sys.platform == "darwin":
-                self.snipButton = QPushButton('Snip [Option+S]', self)
-                self.snipButton.clicked.connect(self.onClick) 
-        else:
-                self.snipButton = QPushButton('Snip [Alt+S]', self)
-                self.snipButton.clicked.connect(self.onClick)
+        self.snipButton = QPushButton('Snip [Alt+S]', self)
+        self.snipButton.clicked.connect(self.onClick)
 
         self.shortcut = QShortcut(QKeySequence("Alt+S"), self)
         self.shortcut.activated.connect(self.onClick)
@@ -98,22 +100,18 @@ class App(QMainWindow):
             text = 'Interrupt'
             func = self.interrupt
         else:
-            if sys.platform == "darwin":
-                text = 'Snip [Option+S]'
-            else: 
-                text = 'Snip [Alt+S]'
+            text = 'Snip [Alt+S]'
             func = self.onClick
-            self.retryButton.setEnabled(True)
         self.shortcut.setEnabled(not self.isProcessing)
         self.snipButton.setText(text)
         self.snipButton.clicked.disconnect()
         self.snipButton.clicked.connect(func)
-        self.displayPrediction() 
+        self.displayPrediction()
 
     @pyqtSlot()
     def onClick(self):
         self.close()
-        if which('gnome-screenshot'):
+        if self.args.gnome:
             self.snip_using_gnome_screenshot()
         else:
             self.snipWidget.snip()
@@ -142,13 +140,13 @@ class App(QMainWindow):
 
         self.show()
         try:
-            self.model.args.temperature = self.tempField.value()
-            if self.model.args.temperature == 0:
-                self.model.args.temperature = 1e-8
+            self.args.temperature = self.tempField.value()
+            if self.args.temperature == 0:
+                self.args.temperature = 1e-8
         except:
             pass
         # Run the model in a separate thread
-        self.thread = ModelThread(img=img, model=self.model)
+        self.thread = ModelThread(img=img, args=self.args, objs=self.objs)
         self.thread.finished.connect(self.returnPrediction)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
@@ -200,14 +198,15 @@ class App(QMainWindow):
 class ModelThread(QThread):
     finished = pyqtSignal(dict)
 
-    def __init__(self, img, model):
+    def __init__(self, img, args, objs):
         super().__init__()
         self.img = img
-        self.model = model
+        self.args = args
+        self.objs = objs
 
     def run(self):
         try:
-            prediction = self.model(self.img)
+            prediction = cli.call_model(self.args, *self.objs, img=self.img)
             # replace <, > with \lt, \gt so it won't be interpreted as html code
             prediction = prediction.replace('<', '\\lt ').replace('>', '\\gt ')
             self.finished.emit({"success": True, "prediction": prediction})
@@ -280,23 +279,15 @@ class SnipWidget(QMainWindow):
 
         startPos = self.startPos
         endPos = self.mouse.position
-        # account for retina display. #TODO how to check if device is actually using retina display
-        factor = 2 if sys.platform == "darwin" else 1
 
-        x1 = int(min(startPos[0], endPos[0]))
-        y1 = int(min(startPos[1], endPos[1]))
-        x2 = int(max(startPos[0], endPos[0]))
-        y2 = int(max(startPos[1], endPos[1]))
+        x1 = min(startPos[0], endPos[0])
+        y1 = min(startPos[1], endPos[1])
+        x2 = max(startPos[0], endPos[0])
+        y2 = max(startPos[1], endPos[1])
 
         self.repaint()
         QApplication.processEvents()
-        try:
-            img = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
-        except Exception as e:
-            if sys.platform == "darwin":
-                img = ImageGrab.grab(bbox=(x1//factor, y1//factor, x2//factor, y2//factor), all_screens=True)
-            else:
-                raise e
+        img = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
         QApplication.processEvents()
 
         self.close()
@@ -304,10 +295,21 @@ class SnipWidget(QMainWindow):
         self.end = QtCore.QPoint()
         self.parent.returnSnip(img)
 
-def main(arguments):
+
+def main():
+    parser = argparse.ArgumentParser(description='GUI arguments')
+    parser.add_argument('-t', '--temperature', type=float, default=.2, help='Softmax sampling frequency')
+    parser.add_argument('-c', '--config', type=str, default='settings/config.yaml', help='path to config file')
+    parser.add_argument('-m', '--checkpoint', type=str, default='checkpoints/weights.pth', help='path to weights file')
+    parser.add_argument('--no-cuda', action='store_true', help='Compute on CPU')
+    parser.add_argument('--no-resize', action='store_true', help='Resize the image beforehand')
+    parser.add_argument('--gnome', action='store_true', help='Use gnome-screenshot to capture screenshot')
+    arguments = parser.parse_args()
     with in_model_path():
-        if os.name != 'nt':
-            os.environ['QTWEBENGINE_DISABLE_SANDBOX'] = '1'
         app = QApplication(sys.argv)
         ex = App(arguments)
-        sys.exit(app.exec())
+        sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()
